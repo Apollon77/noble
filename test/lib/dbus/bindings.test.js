@@ -518,4 +518,52 @@ describe('dbus/bindings', () => {
       expect(() => bindings.discoverServices(null, [])).not.toThrow();
     });
   });
+
+  test('remote drop while Connect() is in flight surfaces as connect(err), not an unhandled rejection (#91)', async () => {
+    const devicePath = '/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF';
+    resetState(adapterTree({
+      [devicePath]: {
+        'org.bluez.Device1': { Address: 'AA:BB:CC:DD:EE:FF', AddressType: 'public', Connected: false }
+      }
+    }));
+
+    // A proxy whose Device1.Connect() stays pending, so the disconnect lands
+    // while _connect is still awaiting the D-Bus call.
+    const props = new EventEmitter();
+    const device1 = new EventEmitter();
+    device1.Connect = jest.fn().mockReturnValue(new Promise(() => {}));
+    device1.Disconnect = jest.fn().mockResolvedValue(undefined);
+    state.proxies.set(devicePath, {
+      path: devicePath,
+      interfaces: { 'org.freedesktop.DBus.Properties': props, 'org.bluez.Device1': device1 },
+      getInterface: name => ({ 'org.freedesktop.DBus.Properties': props, 'org.bluez.Device1': device1 })[name]
+    });
+
+    const unhandled = [];
+    const onUnhandled = err => unhandled.push(err);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const bindings = new DbusBindings();
+      bindings.start();
+      await flush();
+
+      const connects = [];
+      bindings.on('connect', (...a) => connects.push(a));
+
+      bindings.connect('aabbccddeeff');
+      await flush();
+      expect(device1.Connect).toHaveBeenCalled();
+
+      props.emit('PropertiesChanged', 'org.bluez.Device1', wrapDict({ Connected: false }), []);
+      await flush();
+
+      expect(connects.length).toBe(1);
+      expect(connects[0][0]).toBe('aabbccddeeff');
+      expect(connects[0][1]).toBeInstanceOf(Error);
+      expect(connects[0][1].message).toMatch(/disconnected: remote/);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });
